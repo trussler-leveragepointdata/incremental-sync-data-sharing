@@ -51,8 +51,19 @@ Override with `DATABASE_URL` if needed.
 ### Prerequisites
 
 - Docker and Docker Compose
-- Python 3.11+
-- `pip install -r requirements.txt`
+- Python 3.11+ (with `venv` available)
+
+### Set up Python environment
+
+From the repository root, create a virtual environment and install dependencies using the venv binaries directly (no `PATH` / activation required):
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
+```
+
+On Windows, use `.venv\Scripts\pip` instead of `.venv/bin/pip`.
 
 ### Start Postgres
 
@@ -67,8 +78,10 @@ Wait until the database accepts connections. On first start, `db/init.sql` runs 
 From the repository root:
 
 ```bash
-uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+On Windows: `.venv\Scripts\python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 8000`
 
 Health check:
 
@@ -100,7 +113,7 @@ curl -s -X POST "http://localhost:8000/ingest?dry_run=true" | jq .
 Requires Postgres on `localhost:5432` (tests reset the DB via `docker compose down -v` / `up`):
 
 ```bash
-pytest -v
+.venv/bin/python -m pytest -v
 ```
 
 ## Ingest Endpoint
@@ -269,7 +282,7 @@ Manifests and share/event records carry the fingerprint so consumers can detect 
 ## Testing
 
 ```bash
-pytest -v
+.venv/bin/python -m pytest -v
 ```
 
 Covers: initial ingest, incremental ingest after `changes.sql`, no-op ingest, dry run, timestamp-tie watermark, deterministic `run_id`, share/event structure, and checkpoint-not-advanced-on-failure.
