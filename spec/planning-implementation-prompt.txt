@@ -1,0 +1,1113 @@
+You are acting as a principal data engineer and hands-on development manager.
+
+Your task is to design and implement a complete local prototype for an “Incremental Sync + Data Sharing” take-home project.
+
+Do not start by coding immediately. First produce a clear design and implementation plan. Then implement the project end to end according to that plan.
+
+The project must satisfy the specification below exactly.
+
+---
+
+# Project Goal
+
+Build a local prototype of an incremental data-sharing service.
+
+The service reads changed `customers` and `cases` records from Postgres, writes those changes to local lake-style JSONL outputs, produces consumer-facing incremental change-feed artifacts, writes durable event files, and maintains a safe local checkpoint so committed changes are not skipped or duplicated because of timestamp ties or partial failures.
+
+The prototype should demonstrate correctness and judgment around:
+
+- incremental ingestion
+- composite checkpointing
+- deterministic ordering
+- deterministic run IDs
+- replay-safe outputs
+- dry-run behavior
+- practical crash-consistent local storage
+- clear documentation
+- testability
+
+This is a local prototype. Do not overbuild with AWS services, Kafka, Airflow, Debezium, or cloud infrastructure. Those belong only in optional documentation.
+
+---
+
+# Required Repository Structure
+
+Create a repository with at least:
+
+docker-compose.yml
+db/init.sql
+db/changes.sql
+README.md
+src/...
+tests/...
+state/              # created at runtime if needed
+lake/               # created at runtime if needed
+share/              # created at runtime if needed
+events/             # created at runtime if needed
+tmp/                # created at runtime if needed
+
+Use a language/framework that is practical and simple. Prefer Python with FastAPI and pytest unless there is a strong reason to choose something else.
+
+---
+
+# Required Database Contract
+
+Use Docker Compose to start local Postgres.
+
+The Docker Compose file must use exactly:
+
+Image/version: postgres:16
+Exposed port: 5432
+POSTGRES_DB=interop
+POSTGRES_USER=interop
+POSTGRES_PASSWORD=interop
+
+The database connection should work locally using:
+
+postgresql://interop:interop@localhost:5432/interop
+
+---
+
+# Required Schema
+
+Create exactly these tables, columns, and types.
+
+## customers
+
+customer_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY
+name TEXT NOT NULL
+email TEXT NOT NULL UNIQUE
+country TEXT NOT NULL
+updated_at TIMESTAMPTZ NOT NULL
+
+## cases
+
+case_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY
+customer_id BIGINT NOT NULL REFERENCES customers(customer_id)
+title TEXT NOT NULL
+description TEXT NOT NULL
+status TEXT NOT NULL
+updated_at TIMESTAMPTZ NOT NULL
+
+## Required Indexes
+
+CREATE INDEX idx_customers_updated_at ON customers(updated_at);
+CREATE INDEX idx_cases_updated_at ON cases(updated_at);
+CREATE INDEX idx_cases_customer_id ON cases(customer_id);
+
+---
+
+# Required Seed Data: db/init.sql
+
+The seed data must be deterministic.
+
+Rules:
+
+- Do not use randomness.
+- Use a fixed timestamp anchor literal in SQL.
+- Derive row timestamps from that anchor using interval arithmetic.
+- Seed at least 30 customers.
+- Seed at least 200 cases.
+- `updated_at` values must span a 30-day window relative to the fixed anchor.
+- Case text should include varied meaningful keywords, such as:
+  - billing
+  - audit
+  - compliance
+  - payments
+  - reconciliation
+  - onboarding
+  - fraud
+  - AML
+
+The seed data should make downstream lake/share artifacts meaningful and easy to inspect.
+
+---
+
+# Required Change Script: db/changes.sql
+
+This script will be applied between two ingestion runs.
+
+It must deterministically simulate incremental changes using a fixed timestamp literal that is later than every timestamp used in `db/init.sql`.
+
+It must do exactly:
+
+- Update exactly 5 existing cases:
+  - set `updated_at` to the fixed change timestamp
+  - change their `status`
+- Insert exactly 2 new customers with `updated_at` set to the fixed change timestamp
+- Insert exactly 10 new cases linked to a mix of existing and new customers, with `updated_at` set to the fixed change timestamp
+
+After applying `db/changes.sql`, the next ingest should detect:
+
+customers: 2 changed rows
+cases: 15 changed rows
+
+because there are 2 new customers, 5 updated cases, and 10 new cases.
+
+---
+
+# Required Service Endpoint
+
+Build a small HTTP service with one required endpoint:
+
+POST /ingest?dry_run=true|false
+
+The endpoint must incrementally ingest rows from both tables using the checkpoint rules below.
+
+---
+
+# Checkpoint Contract
+
+Store ingestion state locally at:
+
+./state/checkpoint.json
+
+The checkpoint must be per-table and must use a composite watermark, not timestamp alone.
+
+Required shape:
+
+{
+  "customers": {
+    "updated_at": "2026-03-31T12:00:00Z",
+    "last_pk": 30
+  },
+  "cases": {
+    "updated_at": "2026-03-31T12:00:00Z",
+    "last_pk": 200
+  }
+}
+
+For `customers`, `last_pk` means `customer_id`.
+
+For `cases`, `last_pk` means `case_id`.
+
+If no checkpoint exists, treat that as an initial empty watermark.
+
+The checkpoint is a producer-side ingestion checkpoint. It is not a per-consumer cursor.
+
+---
+
+# Required Incremental Query Semantics
+
+For each table, ingest rows where:
+
+updated_at > checkpoint.updated_at
+OR (
+  updated_at = checkpoint.updated_at
+  AND primary_key > checkpoint.last_pk
+)
+
+Rows must be processed in deterministic order:
+
+ORDER BY updated_at ASC, primary_key ASC
+
+This composite watermark is required to avoid missing rows that share the same timestamp.
+
+For the initial run, when no checkpoint exists, ingest all rows from both tables in deterministic order.
+
+---
+
+# Source Consistency Assumption
+
+Concurrent source mutations during a single `/ingest` request are out of scope.
+
+Assume:
+
+- the source Postgres data does not change while a single ingest run is executing
+- transaction snapshotting and cross-table source consistency guarantees are not required beyond this assumption
+
+Document this assumption in the README.
+
+---
+
+# Dry Run Behavior
+
+If called with:
+
+POST /ingest?dry_run=true
+
+The service must:
+
+- compute deltas
+- compute the manifest
+- compute `checkpoint_before`
+- compute predicted `checkpoint_after`
+- compute predicted lake paths and share paths
+- compute deterministic `run_id`
+- write no lake outputs
+- write no durable events
+- write no share artifacts
+- not update `./state/checkpoint.json`
+
+The manifest must include both:
+
+checkpoint_before
+checkpoint_after
+
+For dry run, `checkpoint_after` is informational only. It means the checkpoint that would be committed if the same batch were executed successfully with `dry_run=false`.
+
+The on-disk checkpoint must remain unchanged during dry run.
+
+---
+
+# Non-Dry Run Behavior
+
+If called with:
+
+POST /ingest?dry_run=false
+
+The service must:
+
+- compute deltas
+- compute deterministic `run_id`
+- write lake outputs
+- write durable events
+- write share artifacts
+- return a manifest
+- advance the checkpoint only if the run succeeds end to end
+
+The checkpoint update must happen last.
+
+---
+
+# Practical Crash-Consistency Strategy
+
+Implement staged writes.
+
+The system must not leave itself in this dangerous state:
+
+checkpoint advanced
+but corresponding durable outputs missing or partially committed
+
+The crash-consistency boundary includes:
+
+- touched lake files
+- durable event file
+- share artifact file write/replace
+- checkpoint file
+
+The crash-consistency boundary does not include:
+
+- stdout logging
+- the HTTP response itself
+
+Use a practical local strategy:
+
+1. Compute deltas.
+2. Compute manifest.
+3. Compute `checkpoint_after`.
+4. Compute deterministic `run_id`.
+5. Write all new output content to a temporary run directory, for example `./tmp/runs/<run_id>/`.
+6. Validate staged files.
+7. Promote staged files into final paths where possible.
+8. Write/replace the checkpoint file last using a temp-file-and-atomic-rename strategy.
+
+Checkpoint writing should avoid partial JSON files:
+
+- write `checkpoint.json.tmp`
+- flush/sync if practical
+- atomically rename to `checkpoint.json`
+
+If anything fails before checkpoint update, leave the checkpoint unchanged and clean up temporary files where possible.
+
+The system is not required to implement true multi-file atomic transactions across the filesystem.
+
+However, it must prevent checkpoint advancement ahead of the durable outputs.
+
+---
+
+# Checkpoint Update Failure Recovery
+
+Because the checkpoint is written last, there is a possible safe failure mode:
+
+lake/share/event outputs written
+checkpoint update fails
+
+This should not cause data loss, but it may cause the next run to select the same delta again.
+
+Use the deterministic `run_id` to reduce duplicate writes:
+
+- If the same checkpoint and same source rows produce the same `run_id`
+- and `./events/<run_id>.jsonl` already exists
+- and the referenced output paths exist
+- then treat the prior outputs as already materialized
+- advance the checkpoint to the same `checkpoint_after` without rewriting duplicate lake/share outputs
+
+Document this behavior if implemented.
+
+If this recovery logic is not fully implemented, document the limitation clearly and ensure at minimum that the checkpoint never advances before durable outputs are written.
+
+---
+
+# Deterministic run_id
+
+`run_id` must be deterministic from inputs.
+
+The same source DB state and same checkpoint must produce the same `run_id`.
+
+Implement this strategy:
+
+1. Build a canonical JSON object containing:
+   - `checkpoint_before`
+   - for each table, the ordered delta row identities selected by the incremental query
+
+2. Each row identity should include:
+   - table name
+   - primary key
+   - updated_at
+
+3. Serialize the canonical object with stable key ordering.
+
+4. Hash it using SHA-256.
+
+5. Use the hex digest, or a stable prefix of it, as `run_id`.
+
+Because row identities are already ordered by:
+
+updated_at ASC
+primary_key ASC
+
+the resulting `run_id` must be deterministic for the same source state and checkpoint.
+
+Do not use UUIDs, random values, or current timestamps for `run_id`.
+
+---
+
+# Local Lake Output
+
+Write valid JSONL files to the local filesystem.
+
+Required layout:
+
+./lake/customers/date=YYYY-MM-DD/data.jsonl
+./lake/cases/date=YYYY-MM-DD/data.jsonl
+
+Partitioning rule:
+
+- `YYYY-MM-DD` is the UTC calendar date derived from each row’s `updated_at`.
+
+If a single ingest run touches multiple dates, write multiple partitions.
+
+The lake is an append-only CDC-style change log, not a current-state snapshot.
+
+Each successful non-dry ingest appends the changed rows for that run to the appropriate date partition or partitions.
+
+Records written to the lake for a run must correspond exactly to the incremental delta selected by the checkpoint query for that table.
+
+Rerunning ingest with no source DB changes must not create duplicates because no new delta should be selected.
+
+Deterministic ordering within each batch must follow:
+
+updated_at ASC
+primary_key ASC
+
+A simple acceptable strategy:
+
+- determine incremental delta for each table
+- group changed rows by UTC `updated_at` date
+- append changed rows as JSONL records to the correct partition files
+- ensure a no-op run writes nothing
+
+Lake records may be the row payload itself.
+
+Example lake record for `cases`:
+
+{"case_id":210,"customer_id":32,"title":"Billing dispute","description":"Customer reported duplicate invoice","status":"open","updated_at":"2026-03-31T12:00:00Z"}
+
+---
+
+# Manifest Returned by /ingest
+
+Return a JSON manifest in the response body.
+
+The manifest must include at least:
+
+run_id
+started_at
+finished_at
+dry_run
+checkpoint_before
+checkpoint_after
+
+For each table include:
+
+delta_row_count
+lake_paths
+share_path
+schema_fingerprint
+
+Schema fingerprint:
+
+- A hash of column names and types is sufficient.
+- It should be stable for the same schema.
+
+Manifest path semantics:
+
+- `lake_paths` should list final target lake files for touched partitions.
+- `lake_paths` should be an empty array when `delta_row_count = 0`.
+- `share_path` should be the final target share artifact path when a share artifact is produced.
+- `share_path` should be `null` when `delta_row_count = 0`.
+- For `dry_run=true`, these paths are predicted targets only; no files may be written.
+
+Suggested manifest shape:
+
+{
+  "run_id": "abc123",
+  "started_at": "2026-03-31T12:00:00Z",
+  "finished_at": "2026-03-31T12:00:01Z",
+  "dry_run": false,
+  "checkpoint_before": {
+    "customers": null,
+    "cases": null
+  },
+  "checkpoint_after": {
+    "customers": {
+      "updated_at": "2026-03-31T12:00:00Z",
+      "last_pk": 32
+    },
+    "cases": {
+      "updated_at": "2026-03-31T12:00:00Z",
+      "last_pk": 210
+    }
+  },
+  "tables": {
+    "customers": {
+      "delta_row_count": 2,
+      "lake_paths": ["./lake/customers/date=2026-03-31/data.jsonl"],
+      "share_path": "./share/customers/changes.jsonl",
+      "schema_fingerprint": "..."
+    },
+    "cases": {
+      "delta_row_count": 15,
+      "lake_paths": ["./lake/cases/date=2026-03-31/data.jsonl"],
+      "share_path": "./share/cases/changes.jsonl",
+      "schema_fingerprint": "..."
+    }
+  }
+}
+
+You may adjust exact formatting, but required fields must be present.
+
+---
+
+# Delta Events
+
+After a successful non-dry ingest, produce one event per table.
+
+Durable event file path:
+
+./events/<run_id>.jsonl
+
+The file must contain one valid JSON line per table included in the run.
+
+Each event must include at least:
+
+table
+run_id
+schema_fingerprint
+delta_row_count
+lake_paths
+share_path
+checkpoint_after
+
+Because this is a per-run file, stage it and atomically move it into place as part of the run commit.
+
+Also print one event per table to stdout as a best-effort mirror of the durable event.
+
+Important:
+
+- stdout emission is not part of the crash-consistency boundary
+- a successful run must not be considered failed only because stdout logging was interrupted
+
+If a table has zero delta:
+
+- the event should still exist for that table
+- `delta_row_count` should be `0`
+- `share_path` should be `null`
+
+---
+
+# Consumer-Facing Incremental Share Artifact
+
+After a successful non-dry ingest, produce deterministic consumer-facing incremental share artifacts per table.
+
+Required output paths:
+
+./share/customers/changes.jsonl
+./share/cases/changes.jsonl
+
+These files represent the latest successful incremental batch that an external consumer would read after a successful ingest.
+
+They are not full snapshots.
+
+They are deterministic companion change feeds for downstream synchronization.
+
+Each record must be valid JSON and include at least:
+
+table
+op
+primary key field
+updated_at
+run_id
+schema_fingerprint
+checkpoint_after
+record
+
+Primary key field:
+
+- `customer_id` for customers
+- `case_id` for cases
+
+`op` may be:
+
+upsert
+
+`record` contains the full changed row payload.
+
+Example share record for `cases`:
+
+{
+  "table": "cases",
+  "op": "upsert",
+  "case_id": 210,
+  "updated_at": "2026-03-31T12:00:00Z",
+  "run_id": "abc123",
+  "schema_fingerprint": "def456",
+  "checkpoint_after": {
+    "updated_at": "2026-03-31T12:00:00Z",
+    "last_pk": 210
+  },
+  "record": {
+    "case_id": 210,
+    "customer_id": 32,
+    "title": "Billing dispute",
+    "description": "Customer reported duplicate invoice",
+    "status": "open",
+    "updated_at": "2026-03-31T12:00:00Z"
+  }
+}
+
+Determinism rule:
+
+- Given the same source data and same checkpoint, the share artifact contents and record order must be byte-for-byte identical across repeated successful runs.
+- Because `run_id` is deterministic from inputs, including it in the artifact does not break this requirement.
+
+Ordering rule:
+
+updated_at ASC
+primary_key ASC
+
+Zero-delta rule:
+
+If a successful non-dry run has `delta_row_count = 0` for a table:
+
+- do not create a new share artifact for that table
+- do not modify the existing share artifact for that table
+- report `share_path = null` in the manifest and durable event
+
+This prevents no-op runs from creating misleading or duplicate share batches.
+
+Dry-run rule:
+
+- if `dry_run=true`, do not write share artifacts
+
+---
+
+# README Requirements
+
+Create a clear `README.md` at the repository root before considering the project complete.
+
+## When to write it
+
+- Generate `README.md` **after** core ingest behavior is implemented and **before** final submission.
+- Base the README on the implemented code paths, real directory layout, and commands that work in this repo (not generic placeholders where avoidable).
+- Treat this specification as the source of truth for behavior; the README must not contradict the spec.
+
+## How to generate it
+
+1. **Use the required section outline below** — include every section, in order, with the exact H1/H2 titles shown (minor wording tweaks to H2s are acceptable if meaning is preserved).
+2. **Write for an evaluator** — someone running the project for the first time should be able to start Postgres, run the service, execute ingest, inspect outputs, and run tests without reading the source code.
+3. **Include copy-pasteable commands** for:
+   - `docker compose up -d`
+   - starting the API (`uvicorn src.main:app --reload` or equivalent documented in the repo)
+   - initial ingest, dry-run ingest, applying `db/changes.sql`, and a second incremental ingest
+   - `pytest` (or the repo's documented test command)
+4. **Document real output paths** with examples for:
+   - lake JSONL (`./lake/{table}/date=YYYY-MM-DD/data.jsonl`) — at least one sample line per table type
+   - share JSONL (`./share/{table}/changes.jsonl`) — at least one sample line showing all required share fields
+   - durable events (`./events/<run_id>.jsonl`) — note two lines per run (customers + cases)
+5. **Include a manifest example** (JSON) showing `run_id`, `checkpoint_before`, `checkpoint_after`, and per-table `delta_row_count`, `lake_paths`, `share_path`, `schema_fingerprint`.
+6. **Explain composite checkpointing** — `updated_at` + `last_pk`, incremental SQL semantics, and initial-run behavior when no checkpoint exists.
+7. **Explain dry-run** — manifest-only, predicted paths, checkpoint unchanged, no lake/share/event writes.
+8. **Explain crash consistency** — staged writes under `./tmp/runs/<run_id>/`, promote order, checkpoint written last, recovery when event file + outputs exist for the same `run_id`.
+9. **Cover consumer replay and idempotency** (see `# Consumer Replay and Idempotency Documentation` below) in the README's **Replay and Idempotency** section — do not omit producer vs consumer cursor distinction.
+10. **Cover schema evolution** (see `# Schema Evolution Documentation` below) in the README's **Schema Evolution** section.
+11. **List assumptions and limitations** — especially: source DB stable for the duration of a single `/ingest` request; local prototype scope; no multi-file filesystem transactions.
+
+## Required content checklist
+
+The README must include:
+
+- prerequisites, including Docker and Python
+- how to run the DB and service
+- example calls to `/ingest` (dry run and non-dry run)
+- example outputs for lake files, share artifacts, and events
+- important assumptions
+- local crash-consistency strategy
+- replay/idempotency expectations for downstream consumers
+- how schema evolution would be handled in a production version
+
+## Required section outline
+
+Use these headings (H1 once, then H2s in this order):
+
+# Incremental Sync + Data Sharing Prototype
+
+## Overview
+
+## Project Deliverables
+
+## Database Contract
+
+## Running Locally
+
+## Ingest Endpoint
+
+## Incremental Ingestion and Checkpointing
+
+## Dry Run Behavior
+
+## Output Files
+
+## Manifest
+
+## Crash Consistency Strategy
+
+## Replay and Idempotency
+
+## Schema Evolution
+
+## Testing
+
+## Assumptions and Limitations
+
+## Quality bar
+
+- Use concrete paths relative to the repo root (e.g. `./state/checkpoint.json`).
+- Use ISO-8601 UTC timestamps in examples.
+- Keep prose concise; prefer tables and code blocks for commands and JSON samples.
+- Do not document AWS/Kafka/Airflow implementation details in the README (those belong in optional `ARCHITECTURE_AWS.md` if created).
+
+Keep it clear and evaluator-friendly.
+
+---
+
+# Consumer Replay and Idempotency Documentation
+
+Document that:
+
+- The local checkpoint is a producer-side ingestion checkpoint.
+- It tracks how far the service has safely extracted from Postgres and published to durable outputs.
+- It is not a per-consumer cursor.
+- Consumers that need independent replay should maintain their own offsets/cursors.
+- The lake outputs are the durable replay substrate.
+- The share artifacts represent the latest successful incremental batch.
+- Consumers should deduplicate using stable identifiers such as table name, primary key, updated_at, and run_id.
+- In production, consumer offsets would be maintained separately from ingestion checkpoints.
+
+---
+
+# Schema Evolution Documentation
+
+Document that production schema evolution would use:
+
+- schema fingerprints
+- versioned schemas
+- additive changes by default
+- compatibility checks
+- deprecation windows for breaking changes
+- consumer contract tests
+- table formats such as Iceberg for schema evolution if using a lakehouse model
+
+The local prototype can use a simple schema fingerprint based on column names and types.
+
+---
+
+# Optional AI_USAGE.md
+
+Create an optional `AI_USAGE.md` if practical.
+
+It should document:
+
+- tools/agents used
+- key prompts or transcript excerpts
+- what was verified manually
+- commands run
+- edge cases checked
+- what the AI/tool got wrong and how it was corrected
+
+Include examples of AI guardrails, such as:
+
+- specification is the source of truth
+- reject timestamp-only checkpoints
+- reject random run IDs
+- reject dry-run writes
+- require checkpoint-last behavior
+- manually review generated SQL
+- verify deterministic seed/change data
+- test edge cases before accepting generated code
+
+---
+
+# Optional ARCHITECTURE_AWS.md
+
+Create an optional `ARCHITECTURE_AWS.md`, maximum one page.
+
+This should be documentation only. Do not implement AWS.
+
+Important: do not model the production version as simply “the same local `/ingest` endpoint running on AWS.”
+
+Describe a production-grade AWS ingestion and sharing architecture for the same problem domain:
+
+- incremental customer/case sync
+- durable lake storage
+- event-driven propagation
+- consumer-facing incremental data sharing using open table standards or companion change feeds
+
+Assume production NFRs:
+
+Multi-tenant SaaS:
+- about 5,000 tenants
+
+Data size:
+- 50M customers
+- 200M cases
+
+Change rate:
+- cases up to 5,000 updates/sec peak, 1,000/sec sustained
+- customers up to 500 updates/sec peak
+
+Freshness SLA:
+- new or updated rows reflected in lake and available to consumers within 10 minutes at p95
+
+Consumer/query load:
+- 300 QPS steady
+- burst to 1,000 QPS
+- p95 latency under 300ms
+- p99 latency under 800ms
+
+Availability:
+- ingest and consumer-facing APIs: 99.9% monthly
+
+Recovery:
+- RPO <= 5 minutes
+- RTO <= 30 minutes for APIs
+
+Lake durability:
+- effectively zero data loss
+
+Include:
+
+- high-level Mermaid or ASCII diagram
+- data flow from source changes into durable storage, eventing, and external consumption
+- service choices with rationale
+- reliability and replay strategy
+- idempotency strategy
+- top 3 cost drivers and controls
+- 3 to 6 tradeoffs and assumptions
+
+Suggested AWS architecture:
+
+Aurora/Postgres
+→ AWS DMS or logical replication CDC
+→ Kinesis or MSK
+→ stream processor on ECS/Fargate or Lambda
+→ S3 data lake using Parquet/Iceberg
+→ Glue Catalog/Lake Formation
+→ EventBridge/SQS batch completion events
+→ DynamoDB consumer change index
+→ API Gateway + ECS/Lambda consumer API
+→ external consumers
+
+Make clear that production separates:
+
+source CDC offsets
+lake commit state
+consumer cursors
+
+---
+
+# Optional EXECUTION_PLAN.md
+
+Create an optional `EXECUTION_PLAN.md`, maximum one page.
+
+It should explain how to deliver the AWS production version with a small team.
+
+Include:
+
+- milestones over 2–3 sprints
+- work breakdown and sequencing
+- what the tech lead would personally own
+- what would be delegated
+- quality gates
+- rollout strategy
+- top risks and mitigations
+
+Suggested structure:
+
+Sprint 1: Ingestion foundation and canonical event contract
+Sprint 2: Durable lake, eventing, replay, and idempotency
+Sprint 3: Consumer API, cursor model, production hardening, rollout
+
+Quality gates should include:
+
+- schema contract tests
+- CDC ordering and replay tests
+- idempotent retry tests
+- duplicate delivery tests
+- consumer cursor tests
+- lake commit validation
+- reconciliation checks
+- load tests
+- failure injection tests
+- security review
+- observability review
+
+---
+
+# Required Tests
+
+Implement tests that prove correctness.
+
+At minimum, include tests for:
+
+## 1. Initial ingest
+
+Flow:
+
+1. Start fresh DB.
+2. Ensure no checkpoint exists.
+3. Call `/ingest?dry_run=false`.
+4. Verify all seed customers and cases are ingested.
+5. Verify checkpoint is created.
+6. Verify lake files, share files, and event files exist.
+
+Expected:
+
+customers >= 30
+cases >= 200
+
+## 2. Incremental ingest after changes.sql
+
+Flow:
+
+1. Run initial ingest.
+2. Apply `db/changes.sql`.
+3. Run ingest again.
+4. Verify:
+
+customers delta_row_count = 2
+cases delta_row_count = 15
+
+## 3. No-op ingest
+
+Flow:
+
+1. Run initial ingest.
+2. Apply changes.
+3. Run second ingest.
+4. Run third ingest with no additional changes.
+5. Verify:
+
+customers delta_row_count = 0
+cases delta_row_count = 0
+lake_paths = []
+share_path = null
+
+Also verify no lake/share files were modified inappropriately.
+
+## 4. Dry-run behavior
+
+Flow:
+
+1. Capture current checkpoint and file checksums.
+2. Call `/ingest?dry_run=true`.
+3. Verify manifest includes predicted `checkpoint_after`.
+4. Verify checkpoint unchanged.
+5. Verify no lake/share/event files created or modified.
+
+## 5. Timestamp tie/composite watermark
+
+Create or use rows with identical `updated_at`.
+
+Verify:
+
+- rows are ordered by `updated_at ASC, primary_key ASC`
+- checkpoint uses the highest processed primary key at the tied timestamp
+- rows sharing the same timestamp are not skipped
+
+## 6. Deterministic run_id
+
+Verify that the same source state and same checkpoint produce the same `run_id`.
+
+Reject UUID/time-based IDs.
+
+## 7. Share artifact structure
+
+Verify each JSONL line includes:
+
+table
+op
+primary key field
+updated_at
+run_id
+schema_fingerprint
+checkpoint_after
+record
+
+## 8. Durable event structure
+
+Verify:
+
+- `./events/<run_id>.jsonl` exists for successful non-dry runs
+- it contains one line for customers and one line for cases
+- each line includes required fields
+- zero-delta tables still have an event with `delta_row_count = 0` and `share_path = null`
+
+## 9. Failure safety
+
+Simulate a write failure before checkpoint update.
+
+Verify:
+
+- ingest fails
+- checkpoint remains unchanged
+- no checkpoint advancement occurs ahead of durable outputs
+
+Possible approaches:
+
+- dependency injection / mock file writer
+- test flag to raise exception before checkpoint write
+- write to read-only output path
+
+---
+
+# Implementation Guidance
+
+Produce the design first.
+
+The design should include:
+
+1. File structure.
+2. Main modules/classes/functions.
+3. Data flow through `/ingest`.
+4. Checkpoint read/write logic.
+5. Incremental query logic.
+6. Run ID computation.
+7. Lake writer.
+8. Share artifact writer.
+9. Event writer.
+10. Manifest builder.
+11. Crash-consistency strategy.
+12. Test plan.
+
+After the design is accepted, implement.
+
+Prefer clean, simple code over clever abstractions.
+
+Keep responsibilities separated:
+
+database.py          # Postgres connection and queries
+checkpoint.py        # checkpoint load/save/atomic replace
+run_id.py            # deterministic run_id generation
+schema.py            # schema fingerprint
+writers.py           # lake/share/event writers
+manifest.py          # manifest construction
+service.py/main.py   # FastAPI endpoint
+tests/               # test suite
+
+Use ISO-8601 UTC timestamps consistently.
+
+Ensure JSON output is stable:
+
+- sort keys where useful
+- avoid nondeterministic ordering
+- ensure JSONL has one valid JSON object per line
+
+---
+
+# Commands to Support
+
+Document and support commands similar to:
+
+docker compose up -d
+
+Run service:
+
+uvicorn src.main:app --reload
+
+Initial ingest:
+
+curl -X POST "http://localhost:8000/ingest?dry_run=false"
+
+Dry run:
+
+curl -X POST "http://localhost:8000/ingest?dry_run=true"
+
+Apply changes:
+
+docker exec -i <postgres_container_name> psql -U interop -d interop < db/changes.sql
+
+Run tests:
+
+pytest
+
+Adjust exact commands based on the final implementation, but document them clearly.
+
+---
+
+# Acceptance Criteria
+
+The project is complete when:
+
+1. `docker-compose.yml` starts Postgres 16 on port 5432 with the required database/user/password.
+2. `db/init.sql` creates the exact schema and deterministic seed data.
+3. `db/changes.sql` applies exactly the required deterministic changes.
+4. `/ingest?dry_run=true` computes a manifest and writes nothing.
+5. `/ingest?dry_run=false` writes lake outputs, share artifacts, event files, and advances checkpoint last.
+6. Checkpoint is per-table and uses `updated_at + last_pk`.
+7. Incremental queries use the required composite watermark semantics.
+8. Rows are processed in deterministic order.
+9. `run_id` is deterministic from checkpoint and ordered row identities.
+10. Lake files are valid JSONL at the required paths.
+11. Share artifacts are valid JSONL at the required paths.
+12. Durable event files are valid JSONL at the required paths.
+13. No-op ingest writes no duplicate lake/share outputs.
+14. Tests prove initial ingest, incremental ingest, no-op ingest, dry run, timestamp ties, deterministic run ID, event/share structure, and failure safety.
+15. README explains how to run, inspect, and reason about the project.
+16. Optional docs are included if practical: `AI_USAGE.md`, `ARCHITECTURE_AWS.md`, and `EXECUTION_PLAN.md`.
+
+---
+
+# Important Constraints
+
+Do not silently change the required contracts.
+
+Do not simplify away:
+
+- composite checkpointing
+- deterministic ordering
+- deterministic run ID
+- dry-run read-only behavior
+- share artifacts
+- durable events
+- checkpoint-last safety
+- zero-delta behavior
+
+Reasonable simplifications are allowed only if they are:
+
+- explicit
+- documented
+- consistent with the required contracts
+
+Before writing code, produce the design and implementation plan. Then proceed to implementation.
