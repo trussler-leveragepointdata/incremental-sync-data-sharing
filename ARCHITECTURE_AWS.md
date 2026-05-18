@@ -56,8 +56,23 @@ flowchart LR
 | Freshness | p95 ≤ 10 min to consumer-visible | Micro-batch + index update on Iceberg commit |
 | Consumer API | 300 QPS, 1k burst; p95 <300ms, p99 <800ms | DynamoDB index + API—not Athena on hot path |
 | Availability | 99.9% ingest + APIs | Multi-AZ Aurora, MSK, ECS |
-| API recovery | RPO ≤5 min; RTO ≤30 min | Aurora PITR; MSK replay; blue/green API |
+| API recovery | RPO ≤5 min; RTO ≤30 min | See **Recovery (RPO / RTO)** below |
 | Lake durability | ~zero loss | S3 versioning + Object Lock; Iceberg append-only files + snapshots |
+
+---
+
+## Recovery (RPO / RTO)
+
+Per the exercise NFRs, **RPO ≤ 5 min** and **RTO ≤ 30 min** apply to **ingest and consumer-facing APIs**—not to “rebuild the entire lake from zero” as a single number.
+
+| Objective | Target | What it means here | How the design supports it |
+|-----------|--------|--------------------|----------------------------|
+| **RPO** (max acceptable data loss) | ≤ 5 min | At worst, consumers/API may miss **up to ~5 minutes** of published changes before a failure | Aurora **PITR** (restore source to a point in time); MSK **retention** + replay from last committed offset; Iceberg **snapshots** already committed remain on S3; rebuild DynamoDB index from lake + events if needed |
+| **RTO** (max time to restore service) | ≤ 30 min | Consumer **API** and ingest path back within half an hour | Multi-AZ Aurora failover; redeploy **ECS** processors and API (blue/green); restore API Gateway + DynamoDB index; runbooks—not a single “restart `/ingest`” |
+
+**Not the same as lake durability:** S3/Iceberg targets **durability** (~no loss of committed objects). **RPO/RTO** are **operational recovery** targets for the **serving and ingestion path** after an incident.
+
+**Local prototype analogy:** RPO ≈ how far back you can rewind Postgres + replay MSK; RTO ≈ how fast API + processors are healthy again. `checkpoint.json` maps to **lake commit state**, not consumer RPO.
 
 ---
 
