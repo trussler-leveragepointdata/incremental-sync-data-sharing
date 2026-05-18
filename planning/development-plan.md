@@ -3,19 +3,21 @@
 **Source of truth:** [`spec/planning-implementation-prompt.txt`](../spec/planning-implementation-prompt.txt)  
 **Reference:** [`spec/incremental-sync-data-sharing.pdf`](../spec/incremental-sync-data-sharing.pdf) (requirements align with the TXT prompt; PDF is not machine-readable here, so TXT governs implementation)
 
-**Status:** Plan only — no implementation until explicitly approved.
+**Status:** **Implemented** — local prototype complete; verified with **14 pytest tests** and **16 automated smoke checks** in [`scripts/smoke_verify.sh`](../scripts/smoke_verify.sh).
+
+**Last reviewed:** 2026-05-17 (aligned to repo tree and `src/` behavior).
 
 ---
 
 ## Implementation todos
 
-- [ ] **foundation** — Add `docker-compose.yml`, `db/init.sql` (schema + deterministic seed), `db/changes.sql`, project skeleton and `.gitignore`
-- [ ] **core-modules** — Implement `checkpoint.py`, `database.py`, `run_id.py`, `schema.py` with composite watermark queries
-- [ ] **writers-ingest** — Implement `writers.py`, `manifest.py`, `ingest.py` with staged `tmp/runs` commit and checkpoint-last atomic write
-- [ ] **api** — Implement FastAPI `POST /ingest?dry_run` in `src/main.py` with recovery path for existing `run_id` outputs
-- [ ] **tests** — Implement all 9 pytest scenarios (initial, incremental, noop, dry-run, ties, run_id, share/event structure, failure safety)
-- [ ] **docs** — Write `README.md` and optional `AI_USAGE.md`, `ARCHITECTURE_AWS.md`, `EXECUTION_PLAN.md`
-- [ ] **smoke-verify** — Manual smoke: compose up, initial ingest, apply `changes.sql`, incremental + noop ingest
+- [x] **foundation** — `docker-compose.yml`, `db/init.sql`, `db/changes.sql`, project skeleton, `.gitignore`
+- [x] **core-modules** — `checkpoint.py`, `database.py`, `run_id.py`, `schema.py` (composite watermark queries)
+- [x] **writers-ingest** — `writers.py`, `manifest.py`, `ingest.py` (staged `tmp/runs`, checkpoint-last; share/events via `os.replace`)
+- [x] **api** — FastAPI `POST /ingest?dry_run`, recovery when `run_id` outputs already exist
+- [x] **tests** — 9 spec scenarios + share determinism + schema fingerprint + failure depth; 14 tests passing
+- [x] **docs** — `README.md`, `AI_USAGE.md`, `ARCHITECTURE_AWS.md`, `EXECUTION_PLAN.md`
+- [x] **smoke-verify** — Automated: `./scripts/smoke_verify.sh` (compose, initial → `changes.sql` → incremental → noop → dry-run)
 
 ---
 
@@ -62,11 +64,11 @@ flowchart LR
 
 | Area | Choice | Rationale |
 |------|--------|-----------|
-| Language | Python 3.11+ | Spec preference |
-| HTTP | FastAPI + uvicorn | Spec preference |
-| DB driver | `psycopg` (v3) or `asyncpg` with sync wrapper | Simple incremental queries |
-| Tests | pytest + httpx TestClient | Integration-style against real Postgres in Docker |
-| Config | Env var `DATABASE_URL` defaulting to `postgresql://interop:interop@localhost:5432/interop` | Spec contract |
+| Language | Python **3.11+** recommended; **3.9+** minimum (README; `.venv` may be 3.9) | Spec preference vs local venv |
+| HTTP | FastAPI + uvicorn | Spec preference; run via `.venv/bin/python -m uvicorn` |
+| DB driver | **`psycopg` 3** (sync) | Implemented in `database.py`; no async driver |
+| Tests | pytest + FastAPI `TestClient` | Integration-style against Docker Postgres |
+| Config | `src/config.py`: `DATABASE_URL` + `Paths` (`state/`, `lake/`, `share/`, `events/`, `tmp/`) | Spec contract; tests monkeypatch `get_paths()` |
 
 No AWS, Kafka, Airflow, or Debezium in the implementation (optional docs only).
 
@@ -79,30 +81,36 @@ docker-compose.yml
 db/init.sql
 db/changes.sql
 README.md
-requirements.txt          # or pyproject.toml
+requirements.txt
+scripts/smoke_verify.sh     # 16-check E2E smoke (INF/ING/CHG)
+planning/development-plan.md
+AI_USAGE.md
+ARCHITECTURE_AWS.md
+EXECUTION_PLAN.md
 src/
-  main.py                 # FastAPI app, /ingest route
-  ingest.py               # orchestration pipeline
-  database.py             # connection + incremental queries
-  checkpoint.py           # load/save/atomic replace + watermark math
+  config.py               # DATABASE_URL, Paths, PROJECT_ROOT
+  main.py                 # FastAPI: GET /health, POST /ingest
+  ingest.py               # orchestration pipeline + recovery
+  database.py             # psycopg connect + incremental queries
+  checkpoint.py           # load/save, Watermark, PK_FIELDS
   run_id.py               # canonical JSON + SHA-256
-  schema.py               # schema fingerprint per table
-  writers.py              # lake, share, event staging + promotion
+  schema.py               # schema fingerprint (information_schema)
+  writers.py              # stage/promote lake, share, events
   manifest.py             # manifest assembly
 tests/
-  conftest.py             # docker DB fixtures, temp dirs
+  conftest.py             # fresh_db (compose reset), workspace tmp_path
   test_initial_ingest.py
   test_incremental.py
   test_noop.py
   test_dry_run.py
   test_watermark_ties.py
   test_run_id.py
-  test_artifacts.py
+  test_artifacts.py       # share + event structure (3 tests)
   test_failure_safety.py
+  test_share_determinism.py
+  test_schema_fingerprint.py
 state/   lake/   share/   events/   tmp/   # runtime; .gitignore
 ```
-
-Optional (if time permits): `AI_USAGE.md`, `ARCHITECTURE_AWS.md`, `EXECUTION_PLAN.md`.
 
 ---
 
@@ -125,8 +133,8 @@ Exact tables, columns, types, and indexes per spec (lines 75–96 of prompt).
 
 - Fixed anchor timestamp literal (e.g. `TIMESTAMPTZ '2026-03-01T00:00:00Z'`)
 - Derive all `updated_at` via `anchor + interval` — no randomness
-- ≥30 customers, ≥200 cases
-- `updated_at` spans 30-day window
+- **32 customers**, **210 cases** (meets spec minimums ≥30 / ≥200)
+- `updated_at` spans 30-day window (anchor + day/hour offsets)
 - Case titles/descriptions include keywords: billing, audit, compliance, payments, reconciliation, onboarding, fraud, AML
 
 ### 4.4 Change script (`db/changes.sql`)
@@ -145,17 +153,17 @@ Fixed timestamp **later than** all seed timestamps:
 
 ### 5.1 Composite watermark query (`src/database.py`)
 
-Per table `T` with PK `pk`:
+Per table with PK from `PK_FIELDS`: `customer_id` (customers), `case_id` (cases):
 
 ```sql
-SELECT * FROM T
+SELECT <columns> FROM <table>
 WHERE updated_at > :wm_at
-   OR (updated_at = :wm_at AND pk > :wm_pk)
-ORDER BY updated_at ASC, pk ASC
+   OR (updated_at = :wm_at AND <pk> > :wm_pk)
+ORDER BY updated_at ASC, <pk> ASC
 ```
 
-- **Initial run** (no checkpoint / null watermark): `SELECT * FROM T ORDER BY updated_at ASC, pk ASC` (all rows)
-- **Assumption (document in README):** source data is stable for the duration of a single `/ingest` request
+- **Initial run** (missing checkpoint / null watermark): full table scan with same `ORDER BY`
+- **Assumption (README):** source data is stable for the duration of a single `/ingest` request
 
 ### 5.2 Checkpoint (`src/checkpoint.py`)
 
@@ -167,14 +175,14 @@ ORDER BY updated_at ASC, pk ASC
 
 ### 5.3 Deterministic `run_id` (`src/run_id.py`)
 
-1. Build canonical JSON: `{ "checkpoint_before": ..., "tables": { "customers": [...identities], "cases": [...] } }`
-2. Each identity: `{ "table", "pk", "updated_at" }` in query order
+1. Build canonical JSON: `{ "checkpoint_before": ..., "tables": { "cases": [...], "customers": [...] } }` (tables sorted in payload)
+2. Each identity: `{ "table", "primary_key", "updated_at" }` in query order (`run_id.py`)
 3. `json.dumps(..., sort_keys=True, separators=(",", ":"))`
 4. `run_id = sha256(hex digest)` — no UUIDs, no wall-clock
 
 ### 5.4 Schema fingerprint (`src/schema.py`)
 
-Query `information_schema.columns` (or hardcode from spec) → stable hash of `(column_name, data_type)` ordered by ordinal position.
+**Implemented:** query `information_schema.columns` for `(column_name, data_type)` ordered by `ordinal_position`, canonical JSON + SHA-256.
 
 ---
 
@@ -205,20 +213,24 @@ Shared steps for **both** dry-run and non-dry-run:
 | 3 | If `delta_row_count > 0`, stage `share/{table}/changes.jsonl` (full batch, ordered, `op: upsert`) |
 | 4 | Stage `events/{run_id}.jsonl` — **two lines** (customers + cases); zero-delta table: `delta_row_count=0`, `share_path=null` |
 | 5 | Validate staged JSONL (parse each line) |
-| 6 | **Promote:** append lake partitions; replace share files; move event file to `./events/<run_id>.jsonl` |
-| 7 | Print events to stdout (best-effort, not crash boundary) |
-| 8 | **Last:** atomic checkpoint write |
+| 6 | **Promote:** lake partitions **append** to existing `data.jsonl`; share and event files via **`replace_file_atomic`** (`os.replace` on temp file) |
+| 7 | Print event lines to stdout (best-effort, not crash boundary) |
+| 8 | **Last:** atomic checkpoint write (`checkpoint.json.tmp` → `os.replace`) |
 
 On failure before step 8: leave checkpoint unchanged; clean up `tmp/runs/<run_id>/`.
 
-### 6.3 Checkpoint-failure recovery (recommended)
+**No-op run (`delta_row_count=0`):** still writes `./events/<run_id>.jsonl` (two lines with zero-delta fields); does **not** append lake or replace share. Repeated no-op with the same `run_id` may hit recovery (see §6.3).
 
-If `./events/<run_id>.jsonl` exists and referenced lake/share paths exist for the same `run_id` recomputed from current `checkpoint_before` + DB state:
+### 6.3 Checkpoint-failure recovery (`outputs_materialized`)
 
-- Treat outputs as already materialized
-- Advance checkpoint to `checkpoint_after` without rewriting lake/share
+If `outputs_materialized()` is true for the recomputed `run_id` and manifest paths:
 
-Document behavior in README; tests must at minimum prove checkpoint never advances ahead of outputs.
+- `./events/<run_id>.jsonl` exists, and
+- every `lake_paths` / non-null `share_path` entry in the manifest exists on disk
+
+Then treat outputs as already materialized: **skip** lake/share/event rewrites and only run step 8 (checkpoint write). Used after a crash between promotion and checkpoint, and for idempotent re-runs when artifacts already match.
+
+Documented in README; `test_share_determinism.py::test_share_artifact_unchanged_on_recovery` and failure-safety tests cover related behavior.
 
 ### 6.4 Lake writer
 
@@ -228,7 +240,7 @@ Document behavior in README; tests must at minimum prove checkpoint never advanc
 
 ### 6.5 Share writer
 
-Each line includes: `table`, `op`, PK field, `updated_at`, `run_id`, `schema_fingerprint`, `checkpoint_after`, `record`
+Each line includes: `table`, `op`, `customer_id` or `case_id`, `updated_at`, `run_id`, `schema_fingerprint`, `checkpoint_after`, `record` (`op` is always `upsert`)
 
 - Replace `./share/{table}/changes.jsonl` per successful batch with deltas
 - Zero-delta: do **not** touch existing share file; manifest `share_path=null`
@@ -249,22 +261,26 @@ Required fields per spec: `run_id`, `started_at`, `finished_at`, `dry_run`, `che
 
 ## 8. Test plan (pytest)
 
-Use TestClient against FastAPI with:
+- **HTTP:** FastAPI `TestClient` (`conftest.client`)
+- **Outputs:** `workspace` fixture → `tmp_path` via `get_paths(tmp_path)` monkeypatch
+- **Database:** `fresh_db` runs `docker compose down -v` / `up -d` per test (not testcontainers); skips suite if Postgres is down
 
-- Ephemeral output dirs via `tmp_path` monkeypatch (override paths in config)
-- Postgres from `docker compose` (session-scoped) or testcontainers
+| # | Scenario | Test module | Key assertions |
+|---|----------|-------------|----------------|
+| 1 | Initial ingest | `test_initial_ingest.py` | ≥30 / ≥200 deltas; checkpoint; lake/share/event exist |
+| 2 | After `changes.sql` | `test_incremental.py` | `delta_row_count`: customers=2, cases=15 |
+| 3 | No-op third ingest | `test_noop.py` | Zero deltas; `lake_paths=[]`, `share_path=null`; lake/share checksums unchanged (events may get a new file) |
+| 4 | Dry run | `test_dry_run.py` | Predicted `checkpoint_after`; no checkpoint or lake/share writes |
+| 5 | Timestamp ties | `test_watermark_ties.py` | Composite watermark does not skip PKs at same `updated_at` |
+| 6 | Deterministic `run_id` | `test_run_id.py` | Same DB + checkpoint → identical 64-char hex `run_id` |
+| 7 | Share structure | `test_artifacts.py` | Required fields on every share JSONL line |
+| 8 | Event structure | `test_artifacts.py` | `events/<run_id>.jsonl` has 2 lines; zero-delta event on noop |
+| 9 | Failure safety | `test_failure_safety.py` | Checkpoint unchanged; lake/share/events materialized before failure |
+| 10 | Share determinism | `test_share_determinism.py` | Byte-identical share rewrite; recovery does not duplicate lake/share |
 
-| # | Test | Key assertions |
-|---|------|----------------|
-| 1 | Initial ingest | ≥30 customers, ≥200 cases ingested; checkpoint created; lake/share/event exist |
-| 2 | After `changes.sql` | `delta_row_count`: customers=2, cases=15 |
-| 3 | No-op third ingest | Both tables `delta_row_count=0`, `lake_paths=[]`, `share_path=null`; no duplicate lake/share bytes |
-| 4 | Dry run | Manifest has predicted `checkpoint_after`; checkpoint + file checksums unchanged |
-| 5 | Timestamp ties | Seed or insert rows with same `updated_at`; verify order + composite checkpoint does not skip PKs |
-| 6 | Deterministic `run_id` | Same DB + checkpoint → identical `run_id`; pattern matches hex SHA-256, not UUID |
-| 7 | Share structure | Required fields on every JSONL line |
-| 8 | Event structure | `./events/<run_id>.jsonl` has 2 lines; zero-delta fields correct |
-| 9 | Failure safety | Inject exception / read-only dir before checkpoint write → ingest fails, checkpoint unchanged |
+| 11 | Schema fingerprint | `test_schema_fingerprint.py` | Matches `information_schema`; stable across calls |
+
+**14 tests** collected. Run: `.venv/bin/python -m pytest -v` (requires Docker Postgres on port 5432).
 
 ---
 
@@ -278,52 +294,59 @@ Include commands:
 
 ```bash
 docker compose up -d
-uvicorn src.main:app --reload
+.venv/bin/python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 curl -X POST "http://localhost:8000/ingest?dry_run=false"
 curl -X POST "http://localhost:8000/ingest?dry_run=true"
-docker exec -i <container> psql -U interop -d interop < db/changes.sql
-pytest
+docker exec -i $(docker compose ps -q postgres) psql -U interop -d interop < db/changes.sql
+.venv/bin/python -m pytest -v
+./scripts/smoke_verify.sh
 ```
 
-### Optional (post-core)
+### Optional (post-core) — delivered
 
-- `AI_USAGE.md` — tools, prompts, manual verification, guardrails
-- `ARCHITECTURE_AWS.md` — ≤1 page, production CDC → lake → consumer API (no implementation)
-- `EXECUTION_PLAN.md` — ≤1 page, 2–3 sprint delivery plan
+- [`AI_USAGE.md`](../AI_USAGE.md) — tools, prompts, manual verification, guardrails
+- [`ARCHITECTURE_AWS.md`](../ARCHITECTURE_AWS.md) — production CDC → lake → consumer API (documentation only)
+- [`EXECUTION_PLAN.md`](../EXECUTION_PLAN.md) — 3-sprint delivery plan
 
 ---
 
-## 10. Implementation sequence (after approval)
+## 10. Implementation sequence — complete
 
 ```mermaid
 flowchart TD
   A[docker-compose + db/init.sql + db/changes.sql] --> B[Core modules: checkpoint, database, run_id, schema]
   B --> C[Writers + ingest orchestration]
   C --> D[FastAPI /ingest endpoint]
-  D --> E[pytest suite - all 9 scenarios]
+  D --> E[pytest suite - 9 scenarios + share determinism]
   E --> F[README + optional docs]
-  F --> G[Manual smoke: compose up, 3 ingest runs with changes.sql]
+  F --> G[smoke_verify.sh: compose, initial, changes.sql, incremental, noop, dry-run]
 ```
 
-**Estimated phases:**
+**Phases (done):**
 
-1. **Foundation** (~2–3h): Compose, SQL scripts, project skeleton, `.gitignore` for runtime dirs
-2. **Core engine** (~4–5h): Queries, checkpoint, run_id, staged writers, manifest
-3. **API + recovery** (~2h): FastAPI route, idempotent recovery path
-4. **Tests** (~3–4h): All 9 required test categories
-5. **Docs + polish** (~2h): README, optional AWS/execution/AI docs, manual verification
+1. **Foundation** — Compose, SQL scripts, project skeleton, `.gitignore` for runtime dirs
+2. **Core engine** — Queries, checkpoint, run_id, staged writers, manifest
+3. **API + recovery** — FastAPI route, idempotent recovery path
+4. **Tests** — All required categories + share byte-identical test
+5. **Docs + polish** — README, AWS/execution/AI docs, automated smoke script
 
 ---
 
 ## 11. Acceptance checklist (from spec)
 
-All 16 acceptance criteria in the prompt (lines 1019–1036) must pass before calling the project complete — especially:
+All **16 acceptance criteria** in the prompt (lines 1019–1036) are exercised by pytest and/or smoke script, including:
 
 - Composite checkpoint (`updated_at` + `last_pk`)
 - Checkpoint written **last**
 - Dry-run writes nothing
 - Deterministic `run_id` and share artifact byte identity
 - No-op runs produce no lake/share duplicates
+
+**Smoke script checks (16):** `INF-01`–`03` (venv, Postgres, `/health`); `ING-01`–`11` (initial, incremental, noop, dry-run + checkpoint unchanged); `CHG-01`–`02` (container, `changes.sql`).
+
+**Known gaps (optional, not blocking):**
+
+- Python 3.11: recommended in README; local `.venv` may still be 3.9.x
 
 ---
 
@@ -336,4 +359,4 @@ All 16 acceptance criteria in the prompt (lines 1019–1036) must pass before ca
 
 ---
 
-**Next step:** Reply with approval (or edits). Implementation will not start until you confirm.
+**Implementation complete.** For local verification: `docker compose up -d`, `.venv/bin/python -m pytest -v`, `./scripts/smoke_verify.sh`.

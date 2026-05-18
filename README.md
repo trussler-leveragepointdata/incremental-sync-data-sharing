@@ -10,6 +10,8 @@ The service exposes a single HTTP endpoint:
 
 **Stack:** Python 3.11+, FastAPI, psycopg3, Postgres 16 (Docker), pytest.
 
+Implementation roadmap and acceptance checklist: [`planning/development-plan.md`](planning/development-plan.md).
+
 ## Project Deliverables
 
 | Deliverable | Location |
@@ -51,19 +53,22 @@ Override with `DATABASE_URL` if needed.
 ### Prerequisites
 
 - Docker and Docker Compose
-- Python 3.11+ (with `venv` available)
+- Python **3.11+** recommended (minimum **3.9**; the test suite is run on 3.9+)
 
 ### Set up Python environment
 
-From the repository root, create a virtual environment and install dependencies using the venv binaries directly (no `PATH` / activation required):
+From the repository root, create a virtual environment and install dependencies using the venv binaries directly (no `PATH` / activation required). Prefer Python 3.11 when available:
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv    # or: python3 -m venv .venv on 3.9+
+.venv/bin/python --version  # confirm >= 3.9
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 ```
 
-On Windows, use `.venv\Scripts\pip` instead of `.venv/bin/pip`.
+On Windows, use `.venv\Scripts\pip` and `.venv\Scripts\python` instead of `.venv/bin/...`.
+
+**Note:** Conda or a global `uvicorn` on your PATH can shadow the venv; always run the API and tests via `.venv/bin/python -m ...` as shown below.
 
 ### Start Postgres
 
@@ -107,6 +112,16 @@ curl -s -X POST "http://localhost:8000/ingest?dry_run=false" | jq .
 # 5. Dry run (manifest only, no writes)
 curl -s -X POST "http://localhost:8000/ingest?dry_run=true" | jq .
 ```
+
+### Smoke verification (automated)
+
+Runs the full manual workflow (Postgres, API, initial → changes → incremental → noop → dry run) and checks manifest counts. Prints a report with each check ID, pass/fail status, pass/fail percentages, and a final **PASS** or **FAIL**:
+
+```bash
+./scripts/smoke_verify.sh
+```
+
+Exit code is `0` on pass, `1` if any check fails. Optional: `SMOKE_PORT=8000` `SMOKE_RESET_DB=0` `SMOKE_CLEAN_OUTPUTS=0` (see script header).
 
 ### Run tests
 
@@ -268,7 +283,7 @@ No-op ingests (`delta_row_count = 0`) do not append to lake or replace share fil
 
 ## Schema Evolution
 
-This prototype exposes a per-table **`schema_fingerprint`**: SHA-256 of ordered `(column_name, data_type)` metadata.
+This prototype exposes a per-table **`schema_fingerprint`**: SHA-256 of ordered `(column_name, data_type)` pairs from Postgres `information_schema.columns`.
 
 In production you would typically add:
 
@@ -285,14 +300,18 @@ Manifests and share/event records carry the fingerprint so consumers can detect 
 .venv/bin/python -m pytest -v
 ```
 
-Covers: initial ingest, incremental ingest after `changes.sql`, no-op ingest, dry run, timestamp-tie watermark, deterministic `run_id`, share/event structure, and checkpoint-not-advanced-on-failure.
+Covers: initial ingest, incremental ingest after `changes.sql`, no-op ingest, dry run, timestamp-tie watermark, deterministic `run_id`, share/event structure, share byte-for-byte determinism, and checkpoint-not-advanced-on-failure.
 
 ## Assumptions and Limitations
 
 1. **Stable source during ingest:** Postgres data does not change while a single `/ingest` request runs. No cross-table transactional snapshot beyond that.
-2. **Local filesystem only:** No multi-file atomic transactions; checkpoint-last ordering prevents the dangerous case (checkpoint ahead of missing outputs).
+2. **Local filesystem only:** No multi-file atomic transactions; checkpoint-last ordering prevents the dangerous case (checkpoint ahead of missing outputs). Share and event files are promoted with temp-file + atomic rename; lake partitions are append-only.
 3. **`op` is `upsert` only:** No delete events in share artifacts.
 4. **Single process:** No distributed locking; suitable for local/demo use.
 5. **Postgres 16 + fixed seed:** Reproducible demos; `docker compose down -v` resets data.
 
-Optional docs (if present): `AI_USAGE.md`, `ARCHITECTURE_AWS.md`, `EXECUTION_PLAN.md`.
+Optional documentation:
+
+- [`AI_USAGE.md`](AI_USAGE.md) — how AI tooling was used and verified
+- [`ARCHITECTURE_AWS.md`](ARCHITECTURE_AWS.md) — production AWS target architecture (documentation only)
+- [`EXECUTION_PLAN.md`](EXECUTION_PLAN.md) — 3-sprint delivery plan for the AWS version

@@ -138,6 +138,14 @@ def append_file(src: Path, dest: Path) -> None:
         dest.write_text(data, encoding="utf-8")
 
 
+def replace_file_atomic(src: Path, dest: Path) -> None:
+    """Write staged content to dest via a temp file and atomic rename."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest.with_name(dest.name + ".tmp")
+    shutil.copy2(src, tmp_path)
+    os.replace(tmp_path, dest)
+
+
 def promote_staged_run(staging: Path, paths: Paths) -> None:
     if not staging.exists():
         return
@@ -149,8 +157,7 @@ def promote_staged_run(staging: Path, paths: Paths) -> None:
         if "lake/" in rel.as_posix() and dest.exists():
             append_file(src, dest)
         else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
+            replace_file_atomic(src, dest)
 
 
 def outputs_materialized(

@@ -1,3 +1,4 @@
+# Python 3.9+ required; 3.11+ recommended (see README)
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 psycopg[binary]>=3.1.0
