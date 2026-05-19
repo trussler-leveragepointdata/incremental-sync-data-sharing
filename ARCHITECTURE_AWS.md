@@ -121,3 +121,16 @@ Append-only Parquet files; new visibility via Iceberg **snapshots** (no in-place
 4. **Hot API** reads the change index; **Athena** is analytics/replay, not incremental QPS.
 5. **Single region** v1; multi-region active-active deferred.
 6. **Upsert-only** v1 (aligned with prototype); deletes need a later CDC path.
+
+---
+
+## Production delivery (see execution plan)
+
+Delivery metrics below match [`EXECUTION_PLAN.md`](EXECUTION_PLAN.md) (single source of truth). Same **4 × 2-week** sprints and **~9–10 week** calendar to canary (including **1–2 week** buffer); lean staffing does not shorten sprint boxes.
+
+| Track | Team | Total effort | Calendar to canary |
+|-------|------|--------------|-------------------|
+| **Baseline** | **2 FTE** + tech lead | **~18–20 person-weeks** | **~9–10 weeks** |
+| **AI-assisted** | **1 FTE** + tech lead + **0.5 SRE** | **~16–18 person-weeks** (~20–23 effective on boilerplate) | **~9–10 weeks** |
+
+The prototype’s **13 pytest** scenarios and checkpoint/`run_id` contracts are Sprint 1–2 acceptance fixtures so a **2 + lead** (or **1 + lead + 0.5 SRE** with AI) team can hit milestones without re-proving semantics in AWS.

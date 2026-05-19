@@ -314,4 +314,4 @@ Optional documentation:
 
 - [`AI_USAGE.md`](AI_USAGE.md) — how AI tooling was used and verified
 - [`ARCHITECTURE_AWS.md`](ARCHITECTURE_AWS.md) — production AWS target architecture (documentation only)
-- [`EXECUTION_PLAN.md`](EXECUTION_PLAN.md) — 3-sprint delivery plan for the AWS version
+- [`EXECUTION_PLAN.md`](EXECUTION_PLAN.md) — 4 × 2-week sprints (~9–10 weeks to canary): **baseline** 2 FTE + tech lead (~18–20 person-weeks); **AI-assisted** 1 FTE + tech lead + 0.5 SRE (~16–18 person-weeks)

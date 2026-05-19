@@ -306,7 +306,7 @@ docker exec -i $(docker compose ps -q postgres) psql -U interop -d interop < db/
 
 - [`AI_USAGE.md`](../AI_USAGE.md) — tools, prompts, manual verification, guardrails
 - [`ARCHITECTURE_AWS.md`](../ARCHITECTURE_AWS.md) — production CDC → lake → consumer API (documentation only)
-- [`EXECUTION_PLAN.md`](../EXECUTION_PLAN.md) — 3-sprint delivery plan
+- [`EXECUTION_PLAN.md`](../EXECUTION_PLAN.md) — 4 × 2-week sprints (~9–10 weeks to canary); **baseline** 2 FTE + tech lead (~18–20 pw); **AI-assisted** 1 FTE + tech lead + 0.5 SRE (~16–18 pw)
 
 ---
 

@@ -130,3 +130,16 @@ curl -s -X POST "http://localhost:8000/ingest?dry_run=true" | jq .
 | **Failure-safety test depth** — only asserted checkpoint unchanged | Also assert lake/share/events materialized before simulated checkpoint failure |
 
 For safety-critical items (checkpoint ordering, delta counts, tie handling), I treated agent output as a draft until the spec, SQL, and tests agreed.
+
+---
+
+## Production delivery (AWS) — capacity assumptions
+
+[`EXECUTION_PLAN.md`](EXECUTION_PLAN.md) sizes the AWS build with the same lean staffing this repo reflects:
+
+| Track | Team | Total effort | Calendar |
+|-------|------|--------------|----------|
+| **Baseline** | 2 FTE + tech lead | ~18–20 person-weeks | ~9–10 weeks (4 × 2-week sprints + 1–2 week buffer) |
+| **AI-assisted** | 1 FTE + tech lead + 0.5 SRE | ~16–18 person-weeks (~20–23 effective on boilerplate) | ~9–10 weeks |
+
+**AI’s role in delivery:** higher throughput on IaC, Fargate/Iceberg scaffolding, contract/replay tests, and runbooks (~1.3–1.5× on ~40–50% of sprint work)—**not** shorter sprints or skipped security/load/canary gates. The local prototype and **13 pytest** scenarios de-risk Sprint 1–2 contracts so a smaller builder count can still meet the same milestones.
